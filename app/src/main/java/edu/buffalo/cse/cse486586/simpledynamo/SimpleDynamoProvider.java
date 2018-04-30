@@ -64,6 +64,8 @@ public class SimpleDynamoProvider extends ContentProvider {
     static final String TYPE_READ_ALL_RESPONSE = "readallres";
     static final String TYPE_DELETE_KEY = "deletekey";
     static final String TYPE_DELETE_KEY_RESPONSE = "deletekeyres";
+    static final String TYPE_RECOVERY = "recovery";
+    static final String TYPE_RECOVERY_RESPONSE = "recoveryres";
 
     static final String  onSuccess = "success";
     static final String onFail = "failed";
@@ -111,11 +113,13 @@ public class SimpleDynamoProvider extends ContentProvider {
     public final static ReentrantLock WRITE_REPLICA_LOCK = new ReentrantLock();
     public final static ReentrantLock READ_LOCK = new ReentrantLock();
     public final static ReentrantLock DELETE_LOCK = new ReentrantLock();
+    public final static ReentrantLock RECOVERY_LOCK = new ReentrantLock();
 
     // To store result of query("*")
     public static MatrixCursor queryAllCursor;
     // To store result of query(key)
     public static MatrixCursor queryKeyCursor;
+
 
 	// dbHelper class. Reference: https://developer.android.com/reference/android/database/sqlite/SQLiteOpenHelper.html
 	public static class dbHelper extends SQLiteOpenHelper {
@@ -143,6 +147,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 			TelephonyManager tel = (TelephonyManager) this.getContext().getSystemService(Context.TELEPHONY_SERVICE);
 			String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
 			MYPORT = String.valueOf((Integer.parseInt(portStr)));
+            // Code Source: Project 2b
+            dbHelper help = new dbHelper(getContext());
+            db = help.getWritableDatabase();
+
 			try {
 				ServerSocket serverSocket = new ServerSocket(SERVER_PORT);
 				new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
@@ -152,16 +160,68 @@ public class SimpleDynamoProvider extends ContentProvider {
 				//return;
 
 			}
+            ContentValues cv = new ContentValues();
+            cv.put(KEY, "dummykey");
+            cv.put(VALUE, "dummyval");
+            cv.put(OWNER, MYPORT);
+            db.insert(TABLE_NAME, null, cv);
+			// Failure recovery.
+            Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, null, null, null, null, null);
+            if (cursor.getCount() > 1) {
+                db.delete(TABLE_NAME, null, null);
+
+                // Get my data
+                List<String> successors = SUCCESSOR.get(MYPORT);
+                for(String port: successors){
+                    String msg = (new JSONObject().put(MSG_TYPE, TYPE_RECOVERY)
+                            .put(OWNER, MYPORT)
+                            .put(MSG_FROM,MYPORT)).toString();
+                    synchronized (RECOVERY_LOCK){
+                        String res = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
+                        if(!res.equals(onFail)) {
+                            RECOVERY_LOCK.wait(TIMEOUT);
+                            break;
+                        }
+                    }
+                }
+
+                // Get the replicas to be stored in this node
+                List<String> predecessor = PREDECESSOR.get(MYPORT);
+                for(String port: predecessor){
+                    String msg = (new JSONObject().put(MSG_TYPE, TYPE_RECOVERY)
+                            .put(OWNER, port)
+                            .put(MSG_FROM,MYPORT)).toString();
+                    synchronized (RECOVERY_LOCK){
+                        String res = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
+                        if(!res.equals(onFail)) {
+                            RECOVERY_LOCK.wait(TIMEOUT);
+                        }
+                        else{
+                            List<String> recoverySuccessor = SUCCESSOR.get(port);
+                            for(String node: recoverySuccessor){
+                                if(!node.equals(MYPORT)) {
+                                    synchronized (RECOVERY_LOCK) {
+                                        new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node);
+                                        RECOVERY_LOCK.wait(TIMEOUT);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else{
+                db.delete(TABLE_NAME, null, null);
+            }
+
 
 
 		}
 		catch (Exception e){
 			Log.e(TAG, "OnCreate - Exception");
-
+			e.printStackTrace();
 		}
-		// Code Source: Project 2b
-		dbHelper help = new dbHelper(getContext());
-		db = help.getWritableDatabase();
 		return (db != null);
 	}
 
@@ -847,6 +907,50 @@ public class SimpleDynamoProvider extends ContentProvider {
                 else if(msgType.equals(TYPE_DELETE_KEY_RESPONSE)){
                     synchronized (DELETE_LOCK){
                         DELETE_LOCK.notify();
+                    }
+                }
+
+                // Handling failure recovery message
+                else if(msgType.equals(TYPE_RECOVERY)){
+                    Log.v(TAG, "onProgressUpdate: Recovery message recived from "+ from);
+                    String owner = (String) obj.get(OWNER);
+                    Cursor cursor =  db.query(TABLE_NAME, PROJECTIONS, "owner = '" + owner + "'", null,
+                            null, null, null);
+                    JSONObject obj1 = new JSONObject()
+                            .put(MSG_TYPE,TYPE_RECOVERY_RESPONSE)
+                            .put(MSG_FROM,MYPORT);
+                    int i = 1;
+                    // Code source project 3 simpleDHT
+                    while (cursor.moveToNext()) {
+                        String k = cursor.getString(cursor.getColumnIndex(KEY));
+                        String v = cursor.getString(cursor.getColumnIndex(VALUE));
+                        String keyName = MSG_QUERY_RES_KEY + Integer.toString(i);
+                        String valueName = MSG_QUERY_RES_VALUE + Integer.toString(i);
+                        obj1.put(keyName,k);
+                        obj1.put(valueName,v);
+                        i += 1;
+                    }
+                    obj1.put(OWNER,owner);
+                    obj1.put(MSG_QUERY_RES_COUNT,Integer.toString(i-1));
+                    String reply = obj1.toString();
+                    new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, reply, from);
+                }
+
+                // Handling failure recovery response
+                if(msgType.equals(TYPE_RECOVERY_RESPONSE)){
+                    String owner = (String) obj.get(OWNER);
+                    synchronized (RECOVERY_LOCK) {
+                        int resultCount = Integer.parseInt((String) obj.get(MSG_QUERY_RES_COUNT));
+                        for (int i = 1; i <= resultCount; i++) {
+                            String keyName = MSG_QUERY_RES_KEY + Integer.toString(i);
+                            String valueName = MSG_QUERY_RES_VALUE + Integer.toString(i);
+                            ContentValues cv = new ContentValues();
+                            cv.put(KEY, (String) obj.get(keyName));
+                            cv.put(VALUE, (String) obj.get(valueName));
+                            cv.put(OWNER, owner);
+                            writeHelper(cv,TYPE_RECOVERY_RESPONSE,from);
+                        }
+                        RECOVERY_LOCK.notify();
                     }
                 }
 
