@@ -151,15 +151,17 @@ public class SimpleDynamoProvider extends ContentProvider {
             dbHelper help = new dbHelper(getContext());
             db = help.getWritableDatabase();
 
-			try {
-				ServerSocket serverSocket = new ServerSocket(SERVER_PORT);
-				new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
-			}
-			catch (IOException e) {
-				Log.e(TAG, "Can't create a ServerSocket");
-				//return;
+            try {
+                ServerSocket serverSocket = new ServerSocket(SERVER_PORT);
+                new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
+            }
+            catch (IOException e) {
+                Log.e(TAG, "Can't create a ServerSocket");
+                //return;
 
-			}
+            }
+
+            RW_LOCK.writeLock().lock();
             ContentValues cv = new ContentValues();
             cv.put(KEY, "dummykey");
             cv.put(VALUE, "dummyval");
@@ -214,7 +216,7 @@ public class SimpleDynamoProvider extends ContentProvider {
             else{
                 db.delete(TABLE_NAME, null, null);
             }
-
+            RW_LOCK.writeLock().unlock();
 
 
 		}
@@ -679,9 +681,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 					DataInputStream inputStream = new DataInputStream(newSocket.getInputStream());
 					String strReceived = inputStream.readUTF().trim();
 
+                    RW_LOCK.writeLock().lock();
                     DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
                     outputStream.writeUTF(onSuccess);
                     outputStream.flush();
+                    RW_LOCK.writeLock().unlock();
 
 					inputStream.close();
 
