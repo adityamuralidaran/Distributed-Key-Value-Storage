@@ -115,6 +115,9 @@ public class SimpleDynamoProvider extends ContentProvider {
     public final static ReentrantLock DELETE_LOCK = new ReentrantLock();
     public final static ReentrantLock RECOVERY_LOCK = new ReentrantLock();
 
+    public static boolean isRecoveryActive = false;
+    public static int recoveryReply = 0;
+
     // To store result of query("*")
     public static MatrixCursor queryAllCursor;
     // To store result of query(key)
@@ -135,7 +138,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 		@Override
 		public void onUpgrade(SQLiteDatabase db, int old_version, int new_version){
 			db.execSQL("DROP TABLE IF EXISTS "+TABLE_NAME);
-			onCreate(db);
+			//onCreate(db);
+            db.execSQL(Create_Query);
 		}
 	}
 
@@ -158,10 +162,12 @@ public class SimpleDynamoProvider extends ContentProvider {
             catch (IOException e) {
                 Log.e(TAG, "Can't create a ServerSocket");
                 //return;
+                e.printStackTrace();
 
             }
 
-            RW_LOCK.writeLock().lock();
+            //RW_LOCK.writeLock().lock();
+            /*isRecoveryActive = true;
             ContentValues cv = new ContentValues();
             cv.put(KEY, "dummykey");
             cv.put(VALUE, "dummyval");
@@ -170,6 +176,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			// Failure recovery.
             Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, null, null, null, null, null);
             if (cursor.getCount() > 1) {
+                Log.v(TAG, "Starting Recover Keys");
                 db.delete(TABLE_NAME, null, null);
 
                 // Get my data
@@ -179,7 +186,8 @@ public class SimpleDynamoProvider extends ContentProvider {
                             .put(OWNER, MYPORT)
                             .put(MSG_FROM,MYPORT)).toString();
                     synchronized (RECOVERY_LOCK){
-                        String res = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
+                        String res = sendMessage(msg,port);
+                                //(new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
                         if(!res.equals(onFail)) {
                             RECOVERY_LOCK.wait(TIMEOUT);
                             break;
@@ -194,7 +202,8 @@ public class SimpleDynamoProvider extends ContentProvider {
                             .put(OWNER, port)
                             .put(MSG_FROM,MYPORT)).toString();
                     synchronized (RECOVERY_LOCK){
-                        String res = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
+                        String res = sendMessage(msg,port);
+                                //(new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
                         if(!res.equals(onFail)) {
                             RECOVERY_LOCK.wait(TIMEOUT);
                         }
@@ -203,7 +212,8 @@ public class SimpleDynamoProvider extends ContentProvider {
                             for(String node: recoverySuccessor){
                                 if(!node.equals(MYPORT)) {
                                     synchronized (RECOVERY_LOCK) {
-                                        new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node);
+                                        //new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node);
+                                        sendMessage(msg,port);
                                         RECOVERY_LOCK.wait(TIMEOUT);
                                         break;
                                     }
@@ -212,11 +222,13 @@ public class SimpleDynamoProvider extends ContentProvider {
                         }
                     }
                 }
+                Log.v(TAG, "Ending Recover Keys");
             }
             else{
-                db.delete(TABLE_NAME, null, null);
+               db.delete(TABLE_NAME, null, null);
             }
-            RW_LOCK.writeLock().unlock();
+            //RW_LOCK.writeLock().unlock();
+            isRecoveryActive = false;*/
 
 
 		}
@@ -391,7 +403,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 
     public void writeHelper(ContentValues values, String type, String from){
         try {
-            Cursor cursor = db.query(TABLE_NAME, null, "key = '" + values.get(KEY).toString() + "'", null, null, null, null);
+
+            Log.v(TAG, "WriteHelper Insert: key= "+values.get(KEY).toString()+ " value= "+values.get(VALUE).toString()+" owner: "+
+                    values.get(OWNER).toString()+" from: " + from);
+            db.insertWithOnConflict(TABLE_NAME,null,values,SQLiteDatabase.CONFLICT_REPLACE);
+            /*Cursor cursor = db.query(TABLE_NAME, null, "key = '" + values.get(KEY).toString() + "'", null, null, null, null);
             if (cursor.getCount() < 1) {
                 //RW_LOCK.writeLock().lock();
                 db.insert(TABLE_NAME, null, values);
@@ -406,7 +422,8 @@ public class SimpleDynamoProvider extends ContentProvider {
                 Log.v(TAG, "WriteHelper Update: key= "+values.get(KEY).toString()+ " value= "+values.get(VALUE).toString()+" owner: "+
                         values.get(OWNER).toString()+" from: " + from);
             }
-            cursor.close();
+            cursor.close();*/
+
             /*if(type.equals(TYPE_WRITE)){
                 if(!from.equals(MYPORT)){
                     String key = values.get(KEY).toString();
@@ -517,35 +534,43 @@ public class SimpleDynamoProvider extends ContentProvider {
                     .put(KEY, key)
                     .put(MSG_FROM,MYPORT)).toString();
             //sendMessage(msg,node);
-            String readNode = SUCCESSOR.get(node).get(1);
-            Log.v(TAG, "queryKeyHelper: key = "+key+" readFrom: "+readNode);
-            if(readNode.equals(MYPORT)){
-                Cursor cursor =  db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
-                        null, null, null);
-                return cursor;
-            }
-            else {
-                synchronized (READ_LOCK) {
-                    queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
-                    String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, readNode)).get();
-                    //READ_LOCK.wait(TIMEOUT);
-                    if (!response.equals(onFail)) {
-                        READ_LOCK.wait(TIMEOUT);
-                        return queryKeyCursor;
-                    } else {
-                        //READ_LOCK.notify();
-                        String newNode = SUCCESSOR.get(node).get(0);
-                        //sendMessage(msg,newNode);
-                        Log.v(TAG, "queryKeyHelper_onFail: key = " + key + " readFrom: " + newNode);
-                        if (newNode.equals(MYPORT)) {
-                            Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
-                                    null, null, null);
-                            return cursor;
-                        } else {
-                            queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
-                            new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, newNode);
+            List<String> nodes = new ArrayList<String>(Arrays.asList(SUCCESSOR.get(node).get(1),SUCCESSOR.get(node).get(0),node));
+            for(String readNode:nodes) {
+                //String readNode = port;
+                Log.v(TAG, "queryKeyHelper: key = " + key + " readFrom: " + readNode);
+                if (readNode.equals(MYPORT) && !isRecoveryActive) {
+                    Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
+                            null, null, null);
+                    return cursor;
+                }
+                else {
+                    synchronized (READ_LOCK) {
+                        //queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                        String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, readNode)).get();
+                        //READ_LOCK.wait(TIMEOUT);
+                        if (!response.equals(onFail)) {
                             READ_LOCK.wait(TIMEOUT);
                             return queryKeyCursor;
+                        }
+                        else {
+                            continue;
+                            //READ_LOCK.notify();
+                            /*List<String> newNodes = new ArrayList<String>(Arrays.asList(SUCCESSOR.get(node).get(0), node));
+                            for (String port : newNodes) {
+                                String newNode = port;
+                                //sendMessage(msg,newNode);
+                                Log.v(TAG, "queryKeyHelper_onFail: key = " + key + " readFrom: " + newNode);
+                                if (newNode.equals(MYPORT)) {
+                                    Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
+                                            null, null, null);
+                                    return cursor;
+                                } else {
+                                    //queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                                    new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, newNode);
+                                    READ_LOCK.wait(TIMEOUT);
+                                    return queryKeyCursor;
+                                }
+                            }*/
                         }
                     }
                 }
@@ -569,7 +594,7 @@ public class SimpleDynamoProvider extends ContentProvider {
             return new MatrixCursor(new String[]{KEY, VALUE});
         }
         // to be removed
-        //return null;
+        return new MatrixCursor(new String[]{KEY, VALUE});
     }
 
     public Cursor queryAllHelper(){
@@ -642,7 +667,7 @@ public class SimpleDynamoProvider extends ContentProvider {
             Log.v(TAG, "send to port : "+port);
             Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                     Integer.parseInt(port));
-            socket.setSoTimeout(TIMEOUT);
+            //socket.setSoTimeout(TIMEOUT);
             //String msgToSend = message;
             DataOutputStream outputStream = new DataOutputStream(socket.getOutputStream());
             outputStream.writeUTF(message);
@@ -655,15 +680,82 @@ public class SimpleDynamoProvider extends ContentProvider {
             //socket.close();
             return strReceived;
         } catch (UnknownHostException e) {
-            Log.e(TAG, "ClientTask UnknownHostException");
+            Log.e(TAG, "sendMessage UnknownHostException");
             return onFail;
         } catch (IOException e) {
-            Log.e(TAG, "ClientTask socket IOException");
+            Log.e(TAG, "sendMessage socket IOException");
             e.printStackTrace();
             return onFail;
         }
     }
 
+    public void recoveryHelper(){
+        try{
+            ContentValues cv = new ContentValues();
+            cv.put(KEY, "dummykey");
+            cv.put(VALUE, "dummyval");
+            cv.put(OWNER, MYPORT);
+            db.insert(TABLE_NAME, null, cv);
+            // Failure recovery.
+            Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, null, null, null, null, null);
+            if (cursor.getCount() > 1) {
+                isRecoveryActive = true;
+                Log.v(TAG, "Starting Recover Keys");
+                db.delete(TABLE_NAME, null, null);
+
+                // Get my data
+                List<String> successors = SUCCESSOR.get(MYPORT);
+                for(String port: successors){
+                    String msg = (new JSONObject().put(MSG_TYPE, TYPE_RECOVERY)
+                            .put(OWNER, MYPORT)
+                            .put(MSG_FROM,MYPORT)).toString();
+                    //synchronized (RECOVERY_LOCK){
+                        String res = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
+                        if(!res.equals(onFail)) {
+                            //RECOVERY_LOCK.wait(TIMEOUT);
+                            break;
+                        }
+                    //}
+                }
+
+                // Get the replicas to be stored in this node
+                List<String> predecessor = PREDECESSOR.get(MYPORT);
+                for(String port: predecessor){
+                    String msg = (new JSONObject().put(MSG_TYPE, TYPE_RECOVERY)
+                            .put(OWNER, port)
+                            .put(MSG_FROM,MYPORT)).toString();
+                    //synchronized (RECOVERY_LOCK){
+                        String res = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, port)).get();
+                        if(!res.equals(onFail)) {
+                            //RECOVERY_LOCK.wait(TIMEOUT);
+                            continue;
+                        }
+                        else{
+                            List<String> recoverySuccessor = SUCCESSOR.get(port);
+                            for(String node: recoverySuccessor){
+                                if(!node.equals(MYPORT)) {
+                                    //synchronized (RECOVERY_LOCK) {
+                                        new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node);
+                                        //sendMessage(msg,port);
+                                        //RECOVERY_LOCK.wait(TIMEOUT);
+                                        break;
+                                    //}
+                                }
+                            }
+                        }
+                    //}
+                }
+                Log.v(TAG, "Ending Recover Keys");
+            }
+            else{
+                db.delete(TABLE_NAME, null, null);
+            }
+        }
+        catch (Exception e){
+            Log.e(TAG, "recoveryHelper: Exception");
+            e.printStackTrace();
+        }
+    }
 
 
     // Server Class
@@ -676,18 +768,46 @@ public class SimpleDynamoProvider extends ContentProvider {
 			try {
 				ServerSocket serverSocket = sockets[0];
 
+				// Recovery operation
+				recoveryHelper();
+
 				while (true) {
 					Socket newSocket = serverSocket.accept();
 					DataInputStream inputStream = new DataInputStream(newSocket.getInputStream());
 					String strReceived = inputStream.readUTF().trim();
 
-                    RW_LOCK.writeLock().lock();
-                    DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
-                    outputStream.writeUTF(onSuccess);
-                    outputStream.flush();
-                    RW_LOCK.writeLock().unlock();
+					JSONObject obj = new JSONObject(strReceived);
+                    String msgType = (String) obj.get(MSG_TYPE);
+                    /*if(!msgType.equals(TYPE_RECOVERY_RESPONSE))
+                        RW_LOCK.writeLock().lock();*/
+                    //if(!msgType.equals(TYPE_RECOVERY)) {
+                    if (!isRecoveryActive) {
+                        DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
+                        outputStream.writeUTF(onSuccess);
+                        outputStream.flush();
 
-					inputStream.close();
+                        inputStream.close();
+                        newSocket.close();
+                        publishProgress(strReceived);
+                    }
+                    /*if(!msgType.equals(TYPE_RECOVERY_RESPONSE))
+                    RW_LOCK.writeLock().unlock();*/
+                    else {
+                        DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
+                        if(msgType.equals(TYPE_READ_KEY))
+                            outputStream.writeUTF(onFail);
+                        else
+                            outputStream.writeUTF(onSuccess);
+
+                        outputStream.flush();
+
+                        inputStream.close();
+                        newSocket.close();
+                        publishProgress(strReceived);
+                    }
+                    //}
+
+
 
                     /*JSONObject obj = new JSONObject(strReceived);
                     String msgType = (String) obj.get(MSG_TYPE);
@@ -743,8 +863,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                         new DynamoHelper().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, strReceived);
                     }*/
 
-                    newSocket.close();
-                    publishProgress(strReceived);
 
 
 				}
@@ -754,9 +872,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.e(TAG, "Server Socket IOException");
 				e.printStackTrace();
 			}
-            /*catch (JSONException e){
+            catch (JSONException e){
                 Log.e(TAG, "Server Task JSON Exception");
-            }*/
+            }
 
 			return null;
 		}
@@ -834,7 +952,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                         valueRes = cursor.getString(cursor.getColumnIndex(VALUE));
                     }
                     cursor.close();
-                    Log.v(TAG, "queryKey Response: key = "+keyRes+" requestFrom: "+from);
+                    Log.v(TAG, "queryKey Response: key = "+keyRes+" Request From: "+from);
                     String reply = (new JSONObject()
                             .put(MSG_TYPE,TYPE_READ_KEY_RESPONSE)
                             .put(MSG_FROM,MYPORT)
@@ -851,6 +969,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                         queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
                         String keyRes = (String) obj.get(KEY);
                         String valueRes = (String) obj.get(VALUE);
+                        Log.v(TAG, "queryKey Response: key = "+keyRes+" Response From: "+ from);
                         queryKeyCursor.addRow(new Object[]{keyRes, valueRes});
                         READ_LOCK.notify();
                     }
@@ -943,7 +1062,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 // Handling failure recovery response
                 if(msgType.equals(TYPE_RECOVERY_RESPONSE)){
                     String owner = (String) obj.get(OWNER);
-                    synchronized (RECOVERY_LOCK) {
+                    //synchronized (RECOVERY_LOCK) {
                         int resultCount = Integer.parseInt((String) obj.get(MSG_QUERY_RES_COUNT));
                         for (int i = 1; i <= resultCount; i++) {
                             String keyName = MSG_QUERY_RES_KEY + Integer.toString(i);
@@ -952,10 +1071,17 @@ public class SimpleDynamoProvider extends ContentProvider {
                             cv.put(KEY, (String) obj.get(keyName));
                             cv.put(VALUE, (String) obj.get(valueName));
                             cv.put(OWNER, owner);
+                            Log.v(TAG, "Recovered Key: key= "+(String) obj.get(keyName)+ " value= "+(String) obj.get(valueName)+" owner: "+
+                                    owner+" from: " + from);
                             writeHelper(cv,TYPE_RECOVERY_RESPONSE,from);
                         }
-                        RECOVERY_LOCK.notify();
-                    }
+                        recoveryReply += 1;
+                        if(recoveryReply == 3){
+                            recoveryReply = 0;
+                            isRecoveryActive = false;
+                        }
+                        //RECOVERY_LOCK.notify();
+                    //}
                 }
 
 
@@ -984,7 +1110,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 				String port = String.valueOf((Integer.parseInt(msgs[1]) * 2));
 				Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
 						Integer.parseInt(port));
+                socket.setSoTimeout(TIMEOUT);
 				String msgToSend = msgs[0];
+
 				DataOutputStream outputStream = new DataOutputStream(socket.getOutputStream());
 				outputStream.writeUTF(msgToSend);
 				outputStream.flush();
@@ -992,6 +1120,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 DataInputStream inputStream = new DataInputStream(socket.getInputStream());
                 String strReceived = inputStream.readUTF().trim();
                 inputStream.close();
+
                 Log.v(TAG, "msg from port : "+strReceived);
                 return strReceived;
 				//socket.close();
