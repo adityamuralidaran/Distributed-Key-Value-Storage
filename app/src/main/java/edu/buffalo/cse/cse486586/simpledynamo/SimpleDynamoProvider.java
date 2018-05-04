@@ -14,7 +14,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Formatter;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -100,6 +102,9 @@ public class SimpleDynamoProvider extends ContentProvider {
         put("5558", Arrays.asList("5554","5556"));
         put("5560", Arrays.asList("5558","5554"));
     }};
+
+    // Holdback queue for all the write request during failure recovery.
+    public static Queue<JSONObject> writeBuffer = new LinkedList<JSONObject>();
 
     // My port number
     public static String MYPORT = new String();
@@ -342,7 +347,7 @@ public class SimpleDynamoProvider extends ContentProvider {
             List<String> replicaPorts = new ArrayList<String>(SUCCESSOR.get(node));
             Collections.reverse(replicaPorts);
             for(String replica: replicaPorts){
-                if(replica.equals(MYPORT)){
+                if(replica.equals(MYPORT) && !isRecoveryActive){
                     ContentValues cv = new ContentValues();
                     cv.put(KEY, key);
                     cv.put(VALUE, value);
@@ -364,7 +369,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 }
             }
 
-            if(node.equals(MYPORT)){
+            if(node.equals(MYPORT) && !isRecoveryActive){
                 ContentValues cv = new ContentValues();
                 cv.put(KEY, key);
                 cv.put(VALUE, value);
@@ -464,6 +469,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			String[] selectionArgs, String sortOrder) {
         if (selection.equals("@")) {
             //RW_LOCK.readLock().lock();
+            while(isRecoveryActive){}
             Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, null, selectionArgs, null, null, sortOrder);
             //RW_LOCK.readLock().unlock();
             return cursor;
@@ -479,122 +485,138 @@ public class SimpleDynamoProvider extends ContentProvider {
 	}
 
 	public Cursor queryKeyHelper(String key, String[] selectionArgs, String sortOrder){
-        try {
-            //String key = selection;
-            String keyHash = this.genHash(key);
-            String node = "";
+        synchronized (READ_LOCK) {
+            try {
+                //String key = selection;
+                String keyHash = this.genHash(key);
+                String node = "";
 
-            for(int i = 0; i < NODE_RING.length; i++) {
-                String nodeHash = this.genHash(NODE_RING[i]);
-                if(i == 0){
-                    String prePortHash = this.genHash(NODE_RING[NODE_RING.length-1]);
-                    if((keyHash.compareTo(nodeHash) <= 0) ||
-                            (keyHash.compareTo(nodeHash) > 0) && keyHash.compareTo(prePortHash) > 0){
-                        node = NODE_RING[i];
-                        break;
+                for(int i = 0; i < NODE_RING.length; i++) {
+                    String nodeHash = this.genHash(NODE_RING[i]);
+                    if(i == 0){
+                        String prePortHash = this.genHash(NODE_RING[NODE_RING.length-1]);
+                        if((keyHash.compareTo(nodeHash) <= 0) ||
+                                (keyHash.compareTo(nodeHash) > 0) && keyHash.compareTo(prePortHash) > 0){
+                            node = NODE_RING[i];
+                            break;
+                        }
+                    }
+                    else{
+                        String prePortHash = this.genHash(NODE_RING[i-1]);
+                        if((keyHash.compareTo(nodeHash) < 0 && keyHash.compareTo(prePortHash) > 0) ||
+                                (keyHash.compareTo(nodeHash) == 0)){
+                            node = NODE_RING[i];
+                            break;
+                        }
                     }
                 }
-                else{
-                    String prePortHash = this.genHash(NODE_RING[i-1]);
-                    if((keyHash.compareTo(nodeHash) < 0 && keyHash.compareTo(prePortHash) > 0) ||
-                            (keyHash.compareTo(nodeHash) == 0)){
-                        node = NODE_RING[i];
-                        break;
-                    }
-                }
-            }
-            /*if(node.equals(MYPORT)){
-                //RW_LOCK.readLock().lock();
-                Cursor cursor =  db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", selectionArgs,
-                        null, null, sortOrder);
-                //RW_LOCK.readLock().unlock();
-                return cursor;
-            }
-            else{
-                synchronized (READ_LOCK){
-                    queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
-                    String msg = (new JSONObject().put(MSG_TYPE, TYPE_READ_KEY)
-                            .put(KEY, key)
-                            .put(MSG_FROM,MYPORT)).toString();
-                    //sendMessage(msg,node);
-                    String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node)).get();
-                    if(response.equals(onFail)){
-                        String newNode = SUCCESSOR.get(node).get(0);
-                        //sendMessage(msg,newNode);
-                        new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, newNode);
-                    }
-                    READ_LOCK.wait(TIMEOUT);
-                    return queryKeyCursor;
-                }
-            }*/
-
-
-
-            String msg = (new JSONObject().put(MSG_TYPE, TYPE_READ_KEY)
-                    .put(KEY, key)
-                    .put(MSG_FROM,MYPORT)).toString();
-            //sendMessage(msg,node);
-            List<String> nodes = new ArrayList<String>(Arrays.asList(SUCCESSOR.get(node).get(1),SUCCESSOR.get(node).get(0),node));
-            for(String readNode:nodes) {
-                //String readNode = port;
-                Log.v(TAG, "queryKeyHelper: key = " + key + " readFrom: " + readNode);
-                if (readNode.equals(MYPORT) && !isRecoveryActive) {
-                    Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
-                            null, null, null);
+                /*if(node.equals(MYPORT)){
+                    //RW_LOCK.readLock().lock();
+                    Cursor cursor =  db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", selectionArgs,
+                            null, null, sortOrder);
+                    //RW_LOCK.readLock().unlock();
                     return cursor;
                 }
-                else {
-                    synchronized (READ_LOCK) {
-                        //queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
-                        String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, readNode)).get();
-                        //READ_LOCK.wait(TIMEOUT);
-                        if (!response.equals(onFail)) {
-                            READ_LOCK.wait(TIMEOUT);
-                            return queryKeyCursor;
+                else{
+                    synchronized (READ_LOCK){
+                        queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                        String msg = (new JSONObject().put(MSG_TYPE, TYPE_READ_KEY)
+                                .put(KEY, key)
+                                .put(MSG_FROM,MYPORT)).toString();
+                        //sendMessage(msg,node);
+                        String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node)).get();
+                        if(response.equals(onFail)){
+                            String newNode = SUCCESSOR.get(node).get(0);
+                            //sendMessage(msg,newNode);
+                            new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, newNode);
                         }
-                        else {
-                            continue;
-                            //READ_LOCK.notify();
-                            /*List<String> newNodes = new ArrayList<String>(Arrays.asList(SUCCESSOR.get(node).get(0), node));
-                            for (String port : newNodes) {
-                                String newNode = port;
-                                //sendMessage(msg,newNode);
-                                Log.v(TAG, "queryKeyHelper_onFail: key = " + key + " readFrom: " + newNode);
-                                if (newNode.equals(MYPORT)) {
-                                    Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
-                                            null, null, null);
-                                    return cursor;
-                                } else {
-                                    //queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
-                                    new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, newNode);
-                                    READ_LOCK.wait(TIMEOUT);
-                                    return queryKeyCursor;
-                                }
-                            }*/
-                        }
+                        READ_LOCK.wait(TIMEOUT);
+                        return queryKeyCursor;
+                    }
+                }*/
+
+
+
+                String msg = (new JSONObject().put(MSG_TYPE, TYPE_READ_KEY)
+                        .put(KEY, key)
+                        .put(MSG_FROM,MYPORT)).toString();
+                //sendMessage(msg,node);
+                List<String> nodes = new ArrayList<String>(Arrays.asList(SUCCESSOR.get(node).get(1),SUCCESSOR.get(node).get(0),node));
+                for(String readNode:nodes) {
+                    //String readNode = port;
+                    Log.v(TAG, "queryKeyHelper: key = " + key + " readFrom: " + readNode);
+                    if (readNode.equals(MYPORT) && !isRecoveryActive) {
+                        Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
+                                null, null, null);
+                        return cursor;
+                    }
+                    else {
+
+                            //queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                            String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, readNode)).get();
+                            Log.v(TAG, "waiting for key = " + key + " reading from: " + readNode);
+                            //READ_LOCK.wait(TIMEOUT);
+                            Log.v(TAG, "Resuming after wait for key = " + key + " reading from: " + readNode);
+                            Log.v(TAG, "queryKeyHelper: Response: "+ response);
+                            if (!response.equals(onFail)) {
+                                JSONObject obj = new JSONObject(response);
+                                String msgType = (String) obj.get(MSG_TYPE);
+                                String from = (String) obj.get(MSG_FROM);
+                                //if(msgType.equals(TYPE_READ_KEY_RESPONSE)){
+                                queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                                String keyRes = (String) obj.get(KEY);
+                                String valueRes = (String) obj.get(VALUE);
+                                Log.v(TAG, "queryKey Response: key = "+keyRes+" Response From: "+ from);
+                                queryKeyCursor.addRow(new Object[]{keyRes, valueRes});
+                                //}
+                                //READ_LOCK.wait(TIMEOUT);
+                                return queryKeyCursor;
+                            }
+                            else {
+                                continue;
+                                //READ_LOCK.notify();
+                                /*List<String> newNodes = new ArrayList<String>(Arrays.asList(SUCCESSOR.get(node).get(0), node));
+                                for (String port : newNodes) {
+                                    String newNode = port;
+                                    //sendMessage(msg,newNode);
+                                    Log.v(TAG, "queryKeyHelper_onFail: key = " + key + " readFrom: " + newNode);
+                                    if (newNode.equals(MYPORT)) {
+                                        Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
+                                                null, null, null);
+                                        return cursor;
+                                    } else {
+                                        //queryKeyCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                                        new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, newNode);
+                                        READ_LOCK.wait(TIMEOUT);
+                                        return queryKeyCursor;
+                                    }
+                                }*/
+                            }
+
                     }
                 }
             }
-        }
-        catch (JSONException e){
-            Log.e(TAG, "query key helper - JSON Exception");
-            //RW_LOCK.writeLock().unlock();
+            catch (JSONException e){
+                Log.e(TAG, "query key helper - JSON Exception");
+                //RW_LOCK.writeLock().unlock();
+                return new MatrixCursor(new String[]{KEY, VALUE});
+            }
+            catch (NoSuchAlgorithmException e){
+                Log.e(TAG, "query key helper - NoSuchAlgorithmException");
+                return new MatrixCursor(new String[]{KEY, VALUE});
+            }
+            catch (InterruptedException e){
+                Log.e(TAG, "query key helper - Interrupted Exception");
+                return new MatrixCursor(new String[]{KEY, VALUE});
+            }
+            catch (Exception e){
+                Log.e(TAG, "query key helper - Exception");
+                e.printStackTrace();
+                return new MatrixCursor(new String[]{KEY, VALUE});
+            }
+            // to be removed
             return new MatrixCursor(new String[]{KEY, VALUE});
         }
-        catch (NoSuchAlgorithmException e){
-            Log.e(TAG, "query key helper - NoSuchAlgorithmException");
-            return new MatrixCursor(new String[]{KEY, VALUE});
-        }
-        catch (InterruptedException e){
-            Log.e(TAG, "query key helper - Interrupted Exception");
-            return new MatrixCursor(new String[]{KEY, VALUE});
-        }
-        catch (Exception e){
-            Log.e(TAG, "query key helper - Exception");
-            return new MatrixCursor(new String[]{KEY, VALUE});
-        }
-        // to be removed
-        return new MatrixCursor(new String[]{KEY, VALUE});
     }
 
     public Cursor queryAllHelper(){
@@ -614,12 +636,11 @@ public class SimpleDynamoProvider extends ContentProvider {
                     .put(MSG_FROM,MYPORT)).toString();
             for(String node:NODE_RING) {
                 if(!node.equals(MYPORT)) {
-                    String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node)).get();
-                            //sendMessage(msg,node);
-                    if(!response.equals(onFail)){
-                        // Append keys to queryAllCursor.
-                        synchronized (READ_LOCK){
-                            READ_LOCK.wait(TIMEOUT);
+                    synchronized (READ_LOCK){
+                        String response = (new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg, node)).get();
+                        if(!response.equals(onFail)){
+                            // Append keys to queryAllCursor.
+                                READ_LOCK.wait(TIMEOUT);
                         }
                     }
                 }
@@ -778,32 +799,62 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 					JSONObject obj = new JSONObject(strReceived);
                     String msgType = (String) obj.get(MSG_TYPE);
+                    String from = (String) obj.get(MSG_FROM);
                     /*if(!msgType.equals(TYPE_RECOVERY_RESPONSE))
                         RW_LOCK.writeLock().lock();*/
                     //if(!msgType.equals(TYPE_RECOVERY)) {
                     if (!isRecoveryActive) {
                         DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
-                        outputStream.writeUTF(onSuccess);
-                        outputStream.flush();
+                        if(msgType.equals(TYPE_READ_KEY)){
+                            String key = (String) obj.get(KEY);
+                            Cursor cursor =  db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
+                                    null, null, null);
+                            String keyRes = "";
+                            String valueRes = "";
+                            while (cursor.moveToNext()) {
+                                keyRes = cursor.getString(cursor.getColumnIndex(KEY));
+                                valueRes = cursor.getString(cursor.getColumnIndex(VALUE));
+                            }
+                            cursor.close();
+                            Log.v(TAG, "queryKey Response: key = "+keyRes+" Request From: "+from);
+                            String reply = (new JSONObject()
+                                    .put(MSG_TYPE,TYPE_READ_KEY_RESPONSE)
+                                    .put(MSG_FROM,MYPORT)
+                                    .put(KEY,keyRes)
+                                    .put(VALUE,valueRes)).toString();
 
+                            outputStream.writeUTF(reply);
+                            outputStream.flush();
+                        }
+                        else {
+                            outputStream.writeUTF(onSuccess);
+                            outputStream.flush();
+                        }
                         inputStream.close();
                         newSocket.close();
-                        publishProgress(strReceived);
+
+                        if(!msgType.equals(TYPE_READ_KEY))
+                            publishProgress(strReceived);
                     }
                     /*if(!msgType.equals(TYPE_RECOVERY_RESPONSE))
                     RW_LOCK.writeLock().unlock();*/
                     else {
                         DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
-                        if(msgType.equals(TYPE_READ_KEY))
+                        if(msgType.equals(TYPE_READ_KEY) || msgType.equals(TYPE_WRITE) || msgType.equals(TYPE_WRITE_REPLICA)) {
                             outputStream.writeUTF(onFail);
-                        else
+                            outputStream.flush();
+                            inputStream.close();
+                            newSocket.close();
+                            if(!msgType.equals(TYPE_READ_KEY))
+                                writeBuffer.add(obj);
+                        }
+                        else{
                             outputStream.writeUTF(onSuccess);
-
-                        outputStream.flush();
-
-                        inputStream.close();
-                        newSocket.close();
-                        publishProgress(strReceived);
+                            outputStream.flush();
+                            inputStream.close();
+                            newSocket.close();
+                            publishProgress(strReceived);
+                        }
                     }
                     //}
 
@@ -885,8 +936,6 @@ public class SimpleDynamoProvider extends ContentProvider {
              * The following code displays what is received in doInBackground().
              */
                 String strReceived = strings[0].trim();
-                //new DynamoHelper().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, strReceived);
-
                 JSONObject obj = new JSONObject(strReceived);
                 String msgType = (String) obj.get(MSG_TYPE);
                 String from = (String) obj.get(MSG_FROM);
@@ -902,11 +951,10 @@ public class SimpleDynamoProvider extends ContentProvider {
                             .put(MSG_FROM,MYPORT)).toString();
                     writeHelper(cv,TYPE_WRITE,from);
 
-                    //DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
-                    //outputStream.writeUTF(reply);
-                    //outputStream.flush();
+
                     new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, reply, from);
                 }
+
                 // Handling Write response message
                 else if(msgType.equals(TYPE_WRITE_SUCCESS)){
                     synchronized (WRITE_LOCK){
@@ -924,10 +972,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                     String reply = (new JSONObject().put(MSG_TYPE, TYPE_REPLICA_SUCCESS)
                             .put(MSG_FROM,MYPORT)).toString();
                     writeHelper(cv,TYPE_WRITE_REPLICA,from);
-
-                    //DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
-                    //outputStream.writeUTF(reply);
-                    //outputStream.flush();
                     new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, reply, from);
                 }
 
@@ -941,10 +985,8 @@ public class SimpleDynamoProvider extends ContentProvider {
                 // Handling reading of a key
                 else if(msgType.equals(TYPE_READ_KEY)){
                     String key = (String) obj.get(KEY);
-                    //RW_LOCK.readLock().lock();
                     Cursor cursor =  db.query(TABLE_NAME, PROJECTIONS, "key = '" + key + "'", null,
                             null, null, null);
-                    //RW_LOCK.readLock().unlock();
                     String keyRes = "";
                     String valueRes = "";
                     while (cursor.moveToNext()) {
@@ -958,8 +1000,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                             .put(MSG_FROM,MYPORT)
                             .put(KEY,keyRes)
                             .put(VALUE,valueRes)).toString();
-                    //outputStream.writeUTF(reply);
-                    //outputStream.flush();
+
                     new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, reply, from);
                 }
 
@@ -977,9 +1018,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
                 // Handling reading of all the keys.
                 else if(msgType.equals(TYPE_READ_ALL)){
-                    //.readLock().lock();
                     Cursor cursor = db.query(TABLE_NAME, PROJECTIONS, null, null, null, null, null);
-                    //RW_LOCK.readLock().unlock();
                     JSONObject obj1 = new JSONObject()
                             .put(MSG_TYPE,TYPE_READ_ALL_RESPONSE)
                             .put(MSG_FROM,MYPORT);
@@ -995,15 +1034,12 @@ public class SimpleDynamoProvider extends ContentProvider {
                         i += 1;
                     }
                     obj1.put(MSG_QUERY_RES_COUNT,Integer.toString(i-1));
-                    //outputStream.writeUTF(obj1.toString());
-                    //outputStream.flush();
                     String reply = obj1.toString();
                     new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, reply, from);
                 }
 
                 // Handling read all response
                 else if(msgType.equals(TYPE_READ_ALL_RESPONSE)){
-                    //JSONObject obj = new JSONObject(response);
                     synchronized (READ_LOCK) {
                         int resultCount = Integer.parseInt((String) obj.get(MSG_QUERY_RES_COUNT));
                         for (int i = 1; i <= resultCount; i++) {
@@ -1063,23 +1099,31 @@ public class SimpleDynamoProvider extends ContentProvider {
                 if(msgType.equals(TYPE_RECOVERY_RESPONSE)){
                     String owner = (String) obj.get(OWNER);
                     //synchronized (RECOVERY_LOCK) {
-                        int resultCount = Integer.parseInt((String) obj.get(MSG_QUERY_RES_COUNT));
-                        for (int i = 1; i <= resultCount; i++) {
-                            String keyName = MSG_QUERY_RES_KEY + Integer.toString(i);
-                            String valueName = MSG_QUERY_RES_VALUE + Integer.toString(i);
+                    int resultCount = Integer.parseInt((String) obj.get(MSG_QUERY_RES_COUNT));
+                    for (int i = 1; i <= resultCount; i++) {
+                        String keyName = MSG_QUERY_RES_KEY + Integer.toString(i);
+                        String valueName = MSG_QUERY_RES_VALUE + Integer.toString(i);
+                        ContentValues cv = new ContentValues();
+                        cv.put(KEY, (String) obj.get(keyName));
+                        cv.put(VALUE, (String) obj.get(valueName));
+                        cv.put(OWNER, owner);
+                        Log.v(TAG, "Recovered Key: key= "+(String) obj.get(keyName)+ " value= "+(String) obj.get(valueName)+" owner: "+
+                                owner+" from: " + from);
+                        writeHelper(cv,TYPE_RECOVERY_RESPONSE,from);
+                    }
+                    recoveryReply += 1;
+                    if(recoveryReply == 3){
+                        while(!writeBuffer.isEmpty()){
+                            JSONObject obj1 = writeBuffer.poll();
                             ContentValues cv = new ContentValues();
-                            cv.put(KEY, (String) obj.get(keyName));
-                            cv.put(VALUE, (String) obj.get(valueName));
-                            cv.put(OWNER, owner);
-                            Log.v(TAG, "Recovered Key: key= "+(String) obj.get(keyName)+ " value= "+(String) obj.get(valueName)+" owner: "+
-                                    owner+" from: " + from);
-                            writeHelper(cv,TYPE_RECOVERY_RESPONSE,from);
+                            cv.put(KEY, (String)obj1.get(KEY));
+                            cv.put(VALUE, (String)obj1.get(VALUE));
+                            cv.put(OWNER, (String)obj1.get(OWNER));
+                            writeHelper(cv,TYPE_RECOVERY_RESPONSE,(String)obj1.get(MSG_FROM));
                         }
-                        recoveryReply += 1;
-                        if(recoveryReply == 3){
-                            recoveryReply = 0;
-                            isRecoveryActive = false;
-                        }
+                        recoveryReply = 0;
+                        isRecoveryActive = false;
+                    }
                         //RECOVERY_LOCK.notify();
                     //}
                 }
@@ -1121,7 +1165,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                 String strReceived = inputStream.readUTF().trim();
                 inputStream.close();
 
-                Log.v(TAG, "msg from port : "+strReceived);
                 return strReceived;
 				//socket.close();
 			} catch (UnknownHostException e) {
@@ -1131,12 +1174,16 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.e(TAG, "ClientTask socket IOException");
 				return onFail;
 			}
+			/*catch (JSONException e){
+                Log.e(TAG, "Client task - JSON Exception");
+                return onFail;
+            }*/
 
 			//return null;
 		}
 	}
-
-    // Dynamo helper Class
+    /*
+	// Dynamo helper Class
     // code source : simpleDHT project 3
     private class DynamoHelper extends AsyncTask<String, Void, String> {
 
@@ -1164,7 +1211,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                     //outputStream.flush();
                     new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, reply, from);
                 }
-
 
                 // Handling write replica
                 else if(msgType.equals(TYPE_WRITE_REPLICA)){
@@ -1251,7 +1297,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 Log.e(TAG, "ClientTask UnknownHostException");
             } catch (IOException e) {
                 Log.e(TAG, "ClientTask socket IOException");
-            }*/
+            }
             catch (JSONException e){
                 Log.e(TAG, "failed in doinbackground DynamoHelper- JSON Exception");
             }
@@ -1263,4 +1309,5 @@ public class SimpleDynamoProvider extends ContentProvider {
             return null;
         }
     }
+    */
 }
