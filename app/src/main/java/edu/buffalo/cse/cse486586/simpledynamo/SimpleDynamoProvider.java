@@ -41,10 +41,10 @@ import org.w3c.dom.Node;
 
 public class SimpleDynamoProvider extends ContentProvider {
 
-	//Code Source: simpleDHT Project 3
+	// Initialization of static variables
 	static final String TAG = SimpleDynamoProvider.class.getSimpleName();
 	static final int SERVER_PORT = 10000;
-	static final int TIMEOUT = 1000;
+	static final int TIMEOUT = 2000;
 	static final String KEY = "key";
 	static final String VALUE = "value";
     static final String OWNER = "owner";
@@ -78,7 +78,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 
 
-	//Code Source simpleDHT Project 3
+    // DB for storing Key,Value.
 	public static String DB_NAME = "GroupMessenger.db";
 	public static String TABLE_NAME = "MessageHistory";
 	public static String Create_Query = "CREATE TABLE " + TABLE_NAME +
@@ -112,7 +112,6 @@ public class SimpleDynamoProvider extends ContentProvider {
     public SQLiteDatabase db;
 
     // Lock to Read and Write with fairness
-    // Source: https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/locks/ReentrantReadWriteLock.html
     public final static ReentrantReadWriteLock RW_LOCK = new ReentrantReadWriteLock(true);
     public final static ReentrantLock WRITE_LOCK = new ReentrantLock();
     public final static ReentrantLock WRITE_REPLICA_LOCK = new ReentrantLock();
@@ -151,12 +150,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 	@Override
 	public boolean onCreate() {
 		try {
-			// Code Source: simpleDHT project 3
+
 			Log.v(TAG, "into on create");
 			TelephonyManager tel = (TelephonyManager) this.getContext().getSystemService(Context.TELEPHONY_SERVICE);
 			String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
 			MYPORT = String.valueOf((Integer.parseInt(portStr)));
-            // Code Source: Project 2b
             dbHelper help = new dbHelper(getContext());
             db = help.getWritableDatabase();
 
@@ -259,6 +257,7 @@ public class SimpleDynamoProvider extends ContentProvider {
             String keyHash = this.genHash(key);
             String node = "";
             //Log.v(TAG, "insertHelper: 1st element"+NODE_RING[0]);
+            // Finding the appropriate position for a key in the pre-defined dynamo ring.
             for(int i = 0; i < NODE_RING.length; i++) {
                 String nodeHash = this.genHash(NODE_RING[i]);
                 if(i == 0){
@@ -279,6 +278,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 }
             }
 
+            // Sending message to store the replicas of a key in other nodes.
             List<String> replicaPorts = new ArrayList<String>(SUCCESSOR.get(node));
             Collections.reverse(replicaPorts);
             for(String replica: replicaPorts){
@@ -504,6 +504,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return 0;
 	}
 
+	// Using SHA-1 hashing algorithm.
     private String genHash(String input) throws NoSuchAlgorithmException {
         MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
         byte[] sha1Hash = sha1.digest(input.getBytes());
@@ -514,6 +515,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         return formatter.toString();
     }
 
+    // To get all the missed keys during failure recovery.
     public void recoveryHelper(){
         try{
             ContentValues cv = new ContentValues();
@@ -528,7 +530,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 Log.v(TAG, "Starting Recover Keys");
                 db.delete(TABLE_NAME, null, null);
 
-                // Get my data
+                // Get the data from the successors that belongs to the current node
                 List<String> successors = SUCCESSOR.get(MYPORT);
                 for(String port: successors){
                     String msg = (new JSONObject().put(MSG_TYPE, TYPE_RECOVERY)
@@ -605,6 +607,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                     String msgType = (String) obj.get(MSG_TYPE);
                     String from = (String) obj.get(MSG_FROM);
 
+                    // Handles all the request normally only when if the node is not in the recovery mode.
                     if (!isRecoveryActive) {
                         DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
                         if(msgType.equals(TYPE_READ_KEY)){
@@ -638,7 +641,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                         if(!msgType.equals(TYPE_READ_KEY))
                             publishProgress(strReceived);
                     }
-
+                    // handling request in recovery mode
                     else {
                         DataOutputStream outputStream = new DataOutputStream(newSocket.getOutputStream());
                         if(msgType.equals(TYPE_READ_KEY) || msgType.equals(TYPE_WRITE) || msgType.equals(TYPE_WRITE_REPLICA)) {
@@ -646,6 +649,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                             outputStream.flush();
                             inputStream.close();
                             newSocket.close();
+                            // storing all the write request in a buffer until the recovery operation is complete.
                             if(!msgType.equals(TYPE_READ_KEY))
                                 writeBuffer.add(obj);
                         }
@@ -853,6 +857,10 @@ public class SimpleDynamoProvider extends ContentProvider {
                         writeHelper(cv,TYPE_RECOVERY_RESPONSE,from);
                     }
                     recoveryReply += 1;
+
+                    // Recovery is complete only after the current node receives response from 2 predecessors and 1 successor.
+                    // After the recovery is completed, all the write(and write replica) keys that arrived during the
+                    // recovery operations will be written to DB.
                     if(recoveryReply == 3){
                         while(!writeBuffer.isEmpty()){
                             JSONObject obj1 = writeBuffer.poll();
